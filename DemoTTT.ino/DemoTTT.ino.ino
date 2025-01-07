@@ -1,231 +1,170 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#include <IRLremote.h>
+#include <TM1638plus.h>
 
 #define SCREEN_WIDTH 128  // OLED 宽
 #define SCREEN_HEIGHT 64  // OLED 高
 #define OLED_RESET -1
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+TM1638plus tm(A2, A1, A0, false);
 
-#define IR_RECEIVE_PIN 2  // 红外遥控管脚
-CNec IRLremote;           // 红外遥控实例
-
-char CommData[5];   // 留一点余地
-int CurCommByte = 0;
-bool NewCommMove = false;  
+// 游戏变量
+bool gameRunning = false;           // 游戏状态
+float recent_rewards[4] = {0, 0, 0, 0}; // 每台老虎机最近一次收益
+float total_rewards[4] = {0, 0, 0, 0};  // 每台老虎机累积收益
+float player_total = 0;             // 玩家累计收益
+float ai_total = 0;                 // AI累计收益
+int currentMachine = -1;            // 玩家当前选择的老虎机
+int rounds = 0;                     // 当前轮次，最大为10
 
 void setup() {
   Serial.begin(115200);
-  delay(100);  
+  delay(100);
 
-  // 初始化红外接收器
-  IRLremote.begin(IR_RECEIVE_PIN);
-  delay(100);  
+  // 初始化TM1638
+  tm.displayBegin();
+  pinMode(13, OUTPUT);
 
   // 初始化OLED
-  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
     Serial.println("SSD1306 Fail");
-    for(;;);
+    for (;;);
   }
 
   display.clearDisplay();
-  delay(100);  
-  drawBoard();
+  delay(100);
+  drawSlotMachines();
 }
 
-unsigned long IrCmd = 0; 
 void loop() {
-  if (IRLremote.available()) {
-    auto data = IRLremote.read();
-    IrCmd = data.command;
-    if (IrCmd != 0){
-      //Serial.println(IrCmd,HEX);    // 调试用
-      handleIRInput(IrCmd);           // 游戏处理
-      delay(100);
-    }    
+  // 读取TM1638按键
+  char buttons = tm.readButtons();
+
+  // 按下第五个按钮，开始游戏
+  if ((buttons & 0b00001000) != 0 && !gameRunning) { // S5按钮
+    gameRunning = true;
+    Serial.println("start");
+    resetGame();
   }
-  if (NewCommMove == true) {
-    //Serial.println(CommData);
-    handleCommInput();    
-    NewCommMove = false;
-    CurCommByte = 0;
+
+  // 按下第六个按钮，重置游戏
+  if ((buttons & 0b00000100) != 0 && gameRunning) { // S6按钮
+    resetGame();
   }
-}
 
-// ============================== 以下为串口数据部分 =====================
+  // 玩家选择老虎机 (按钮1-4)
+  if (gameRunning) {
+    if ((buttons & 0b10000000) != 0) currentMachine = 0; // S1
+    if ((buttons & 0b01000000) != 0) currentMachine = 1; // S2
+    if ((buttons & 0b00100000) != 0) currentMachine = 2; // S3
+    if ((buttons & 0b00010000) != 0) currentMachine = 3; // S4
 
-void serialEvent() {
-  if (!Serial.available()) return;
-  CommData[CurCommByte] = (char)Serial.read();    
-  CurCommByte ++;
-  if (CurCommByte >= 4) NewCommMove = true;
-}
+    if (currentMachine != -1) {
+      Serial.print("MACHINE:");
+      Serial.println(currentMachine); // 发送选择的老虎机编号到串口
 
-// ============================== 以下为游戏数据部分 =====================
-char board[3][3] = {        // 目前落子情况
-  {' ', ' ', ' '},
-  {' ', ' ', ' '},
-  {' ', ' ', ' '}
-};
-int currentRow = 0;         // 光标位置：行
-int currentCol = 0;         // 光标位置：列
-bool playerTurn = true;     // true 为轮到 X，false 为轮到 O
+      // 等待串口返回收益
+      while (Serial.available() == 0);
+      String data = Serial.readString().trim(); // 数据格式: "PLAYER_REWARD:AI_REWARD"
+      
+      if(data[0] == 'W'){  // 如果收到胜者数据
+        String winner = data.substring(data.indexOf(":") + 1);
+        
+        // 清除部分屏幕或重置显示
+        display.clearDisplay();
 
-// ============================== 以下为游戏逻辑部分 =====================
-void handleCommInput(){
-  int Row = CommData[1]-'1';
-  int Col = CommData[3]-'1';
-  if(board[Row][Col] != ' ') return;
+        // 绘制胜者信息
+        display.setTextSize(2);  // 设置文字大小
+        display.setTextColor(WHITE);  // 设置文字颜色
+        display.setCursor(10, 25);  // 设置文字位置（屏幕中心）
+        display.print("Winner:");  // 显示 "Winner:"
+        display.setCursor(10, 45);
+        display.print(winner);  // 显示具体胜者（如 "Player" 或 "AI"）
 
-  board[Row][Col] = playerTurn ? 'X' : 'O';
-  currentRow = Row;
-  currentCol = Col;
-  playerTurn = !playerTurn;
-  drawBoard();
-  
-  if(checkWin()) {
-    //display.clearDisplay();
-    display.setCursor(0,0);
-    display.print(!playerTurn ? "X win" : "O win");
-    display.display();
-  }  
-}
-
-void handleIRInput(unsigned long value) {
-  bool newMove = false;
-  switch(value) {
-    case 0x16: // * 
-      resetGame();
-      break;
-    case 0x18: // 上
-      currentRow = (currentRow + 2) % 3;
-      break;
-    case 0x52: // 下
-      currentRow = (currentRow + 1) % 3;
-      break;
-    case 0x08: // 左
-      currentCol = (currentCol + 2) % 3;
-      break;
-    case 0x5A: // 右
-      currentCol = (currentCol + 1) % 3;
-      break;
-    case 0x1C: // OK键
-      if(board[currentRow][currentCol] == ' ') {
-        board[currentRow][currentCol] = playerTurn ? 'X' : 'O';
-        playerTurn = !playerTurn;
-        newMove = true;
+        display.display();  // 更新显示
+        delay(1000);
+        resetGame();
+        return;
       }
-      break;
-  }
-  drawBoard();    // 刷新屏幕（可能是移动，可能是落子）
 
-  if (newMove == true){ 
-    if(checkWin()) {
-      //display.clearDisplay();
-      display.setCursor(0,0);
-      display.print(!playerTurn ? "X win" : "O win");
-      display.display();
+      float player_reward = data.substring(0, data.indexOf(":")).toFloat();
+      float ai_reward = data.substring(data.indexOf(":") + 1).toFloat();
+      player_total += player_reward;
+      ai_total += ai_reward;
+
+      // 更新收益
+      recent_rewards[currentMachine] = player_reward;
+      total_rewards[currentMachine] += player_reward;
+
+      // 更新轮次
+      rounds++;
+
+      // 重绘老虎机收益和玩家、AI的总收益
+      drawSlotMachines();
+      currentMachine = -1; // 重置选择
     }
-    else{
-      Serial.print("R");
-      Serial.print(currentRow+1);
-      Serial.print("C");
-      Serial.println(currentCol+1);        
-    }  
   }
 }
 
-bool checkWin() {
-  // 检查行
-  for(int i = 0; i < 3; i++) {
-    if(board[i][0] != ' ' && board[i][0] == board[i][1] && board[i][1] == board[i][2]) {
-      return true;
-    }
-  }
-  
-  // 检查列
-  for(int i = 0; i < 3; i++) {
-    if(board[0][i] != ' ' && board[0][i] == board[1][i] && board[1][i] == board[2][i]) {
-      return true;
-    }
-  }
-  
-  // 检查对角线
-  if(board[0][0] != ' ' && board[0][0] == board[1][1] && board[1][1] == board[2][2]) {
-    return true;
-  }
-  if(board[0][2] != ' ' && board[0][2] == board[1][1] && board[1][1] == board[2][0]) {
-    return true;
-  }
-  
-  return false;
-}
-
+// ============================== 游戏状态重置 ==============================
 void resetGame() {
-  for(int i = 0; i < 3; i++) {
-    for(int j = 0; j < 3; j++) {
-      board[i][j] = ' ';
-    }
+  Serial.println("reset");
+  gameRunning = false;
+  currentMachine = -1;
+  player_total = 0;
+  ai_total = 0;
+  rounds = 0;  // 重置轮次
+
+  // 重置收益数据
+  for (int i = 0; i < 4; i++) {
+    recent_rewards[i] = 0;
+    total_rewards[i] = 0;
   }
-  currentRow = 0;
-  currentCol = 0;
-  playerTurn = true;
-  drawBoard();
-  Serial.println("*");
+
+  drawSlotMachines();
 }
 
-
-// ============================== 以下为游戏绘制部分 =====================
-void drawX(int col, int row) {
-  int x = col * 20 + 37;
-  int y = row * 20 + 5;
-  display.drawLine(x, y, x + 14, y + 14, WHITE);
-  display.drawLine(x, y + 14, x + 14, y, WHITE);
-}
-
-void drawO(int col, int row) {
-  int x = col * 20 + 44;
-  int y = row * 20 + 12;
-  display.drawCircle(x, y, 7, WHITE);
-}
-
-void drawBoard() {
+// ============================== 绘制老虎机 ==============================
+void drawSlotMachines() {
   display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(WHITE);
-  
-  // 画棋盘线  行高20；线位置：2,22,42,62；列宽20；线位置：34,54,74,94
-  display.drawLine(34,  2, 34, 62, WHITE);
-  display.drawLine(54,  2, 54, 62, WHITE);
-  display.drawLine(74,  2, 74, 62, WHITE);
-  display.drawLine(94,  2, 94, 62, WHITE);
-  display.drawLine(34,  2, 94,  2, WHITE);
-  display.drawLine(34, 22, 94, 22, WHITE);
-  display.drawLine(34, 42, 94, 42, WHITE);
-  display.drawLine(34, 62, 94, 62, WHITE);
-  
-  // 绘制棋子
-  for(int i = 0; i < 3; i++) {
-    for(int j = 0; j < 3; j++) {
-      if(board[i][j] == 'X') {
-        drawX(j, i);
-      } else if(board[i][j] == 'O') {
-        drawO(j, i);
-      }
-    }
-  }
-  
-  // 绘制光标
-  display.drawRect(currentCol * 20 + 36, currentRow * 20 + 4, 17, 17, WHITE);
 
-  // 绘制当前玩家
-  if (playerTurn == true) {
-    display.drawLine(110, 25, 110 + 14, 25 + 14, WHITE);
-    display.drawLine(110, 25 + 14, 110 + 14, 25, WHITE);
+  // 绘制老虎机框架
+  display.drawRect(0, 0, 60, 30, SSD1306_WHITE);   // 老虎机1
+  display.drawRect(68, 0, 60, 30, SSD1306_WHITE);  // 老虎机2
+  display.drawRect(0, 34, 60, 30, SSD1306_WHITE);  // 老虎机3
+  display.drawRect(68, 34, 60, 30, SSD1306_WHITE); // 老虎机4
+
+  // 显示每台老虎机的收益
+  for (int i = 0; i < 4; i++) {
+    int x_offset = (i % 2 == 0) ? 2 : 70; // X轴偏移
+    int y_offset = (i < 2) ? 2 : 36;      // Y轴偏移
+
+    // 最近一次收益
+    display.setCursor(x_offset, y_offset);
+    display.print("R:"); // 最近收益
+    display.print(recent_rewards[i]);
+
+    // 累积收益
+    display.setCursor(x_offset, y_offset + 10);
+    display.print("T:"); // 累积收益
+    display.print(total_rewards[i]);
   }
-  else {
-    display.drawCircle(118, 32, 7, WHITE);
-  }  
+
+  // 显示玩家和AI累计收益
+  display.setCursor(0, 54); // 玩家收益
+  display.print("P:"); 
+  display.print(player_total);
+
+  display.setCursor(68, 54); // AI收益
+  display.print("AI:");
+  display.print(ai_total);
+
+  // 显示当前轮次
+  display.setCursor(110, 10); // 设置位置
+  display.setTextSize(1);
+  display.print("Round: ");
+  display.print(rounds);
+
   display.display();
 }
